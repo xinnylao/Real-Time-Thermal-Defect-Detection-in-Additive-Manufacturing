@@ -1,0 +1,144 @@
+###############################################################################
+# 1) JobManager Deployment
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-jobmanager-v2
+  namespace: group-6
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flink
+      component: jobmanager
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: jobmanager
+    spec:
+      containers:
+        - name: jobmanager
+          image: flink:1.19.1-scala_2.12
+          args: [ "jobmanager" ]
+          env:
+            - name: JOB_MANAGER_RPC_ADDRESS
+              value: flink-jobmanager-v2
+          ports:
+            - containerPort: 6123
+            - containerPort: 6124
+            - containerPort: 8081
+          resources:
+            limits:
+              cpu:    "2"
+              memory: "3Gi"
+            requests:
+              cpu:    "1"
+              memory: "3Gi"
+
+---
+###############################################################################
+# 2) TaskManager Deployment
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-taskmanager-v2
+  namespace: group-6
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flink
+      component: taskmanager
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: taskmanager
+    spec:
+      containers:
+        - name: taskmanager
+          image: flink:1.19.1-scala_2.12
+          args: [ "taskmanager" ]
+          env:
+            - name: JOB_MANAGER_RPC_ADDRESS
+              value: flink-jobmanager-v2
+            - name: FLINK_PROPERTIES
+              value: |
+                taskmanager.numberOfTaskSlots: 16
+                parallelism.default: 16
+          ports:
+            - containerPort: 6121
+            - containerPort: 6122
+          resources:
+            limits:
+              cpu:    "13.5"
+              memory: "12Gi"
+            requests:
+              cpu:    "13.5"
+              memory: "12Gi"
+
+---
+###############################################################################
+# 3) JobManager Service   (Cluster-IP,TM / client )
+###############################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager-v2
+  namespace: group-6
+spec:
+  selector:
+    app: flink
+    component: jobmanager
+  type: ClusterIP
+  ports:
+    - name: rpc
+      port: 6123
+      targetPort: 6123
+    - name: blob
+      port: 6124
+      targetPort: 6124
+    - name: ui
+      port: 8081
+      targetPort: 8081
+
+---
+###############################################################################
+# 4) client Job BenchmarkLauncher.jar
+###############################################################################
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flink-submit-job-v2
+  namespace: group-6
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: submitter
+          image: xinnylao/flink-job-image:latest
+          command: [ "/bin/sh", "-c" ]
+          args:
+            - |
+              until curl -s http://flink-jobmanager-v2:8081/overview > /dev/null; do
+                echo "Waiting for JobManager to be ready..."
+                sleep 3
+              done
+              echo "JobManager is ready. Submitting job..."
+
+              flink run -m flink-jobmanager-v2:8081 \
+                /opt/flink/usrlib/BenchmarkLauncher.jar \
+                --api.token=ojkkohsiyqsbuwljmdpfbxiwuvweffzt \
+                --benchmark.api=http://challenge2025.debs.org:52923
+          resources:
+            limits:
+              cpu:    "0.5"
+              memory: "1Gi"
+            requests:
+              cpu:    "0.25"
+              memory: "1Gi"
+      restartPolicy: Never

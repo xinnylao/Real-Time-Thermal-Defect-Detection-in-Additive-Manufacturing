@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: budebs1
+  namespace: group-6
+spec:
+  template:
+    spec:
+      containers:
+      - name: debs
+        image: zishuoliu/debs:latest  
+        env:
+        - name: API_TOKEN
+          value: ojkkohsiyqsbuwljmdpfbxiwuvweffzt
+        resources:
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+        volumeMounts:
+        - name: checkpoint-vol
+          mountPath: /checkpoint-data
+      restartPolicy: OnFailure
+      volumes:
+      - name: checkpoint-vol
+        emptyDir: {}
