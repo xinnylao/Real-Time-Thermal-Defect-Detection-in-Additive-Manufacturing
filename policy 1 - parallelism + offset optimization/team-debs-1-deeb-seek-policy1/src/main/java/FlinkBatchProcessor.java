@@ -1,0 +1,217 @@
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.flink.api.common.restartstrategy.RestartStrategies;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.KeyedStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.util.Collector;
+import org.apache.flink.api.common.typeinfo.TypeHint;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
+import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.http.io.entity.ByteArrayEntity;
+import org.msgpack.jackson.dataformat.MessagePackFactory;
+import java.awt.image.BufferedImage;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+
+@Slf4j
+public class FlinkBatchProcessor {
+
+    public static void main(String[] args) throws Exception {
+
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(16);
+        //Just one loop count, then the job will finish.
+        env.getConfig().setRestartStrategy(RestartStrategies.noRestart());
+
+        DataStream<Map<String, Object>> batchStream =
+                env.addSource(new BatchAPISource(0));
+
+        DataStream<Map<String, Object>> validatedStream = batchStream.map(value -> {
+                    if (value == null) {
+                        log.error("Received null message!");
+                    } else if (!value.containsKey("tile_id")) {
+                        log.error("Message missing 'tile_id' key: {}", value);
+                    } else {
+                        log.debug("Received valid message with tile_id: {}", value.get("tile_id"));
+                    }
+                    return value;
+                })
+                .returns(new TypeHint<>() {});
+        int numWorkers = 16;
+        DataStream<Map<String, Object>> partitionedStream = validatedStream
+                .partitionCustom(new TilePartitioner(numWorkers), new TileKeySelector());
+
+        KeyedStream<Map<String, Object>, Integer> keyedStream = partitionedStream
+                .keyBy(data -> (Integer) data.get("tile_id"));
+
+        DataStream<ProcessedResult> resultStream = keyedStream
+                .process(new TileProcessor());
+
+        resultStream.print();
+
+        env.execute("Flink Job ");
+
+    }
+
+    public static class TileProcessor extends KeyedProcessFunction<Integer, Map<String, Object>, ProcessedResult> {
+        private transient ValueState<LinkedList<BufferedImage>> windowState;
+        private static final int WINDOW_SIZE = 3;
+        public static final AtomicBoolean shouldExit = new AtomicBoolean(false);
+
+
+        @Override
+        public void open(Configuration parameters) {
+            TypeInformation<LinkedList<BufferedImage>> typeInfo =
+                    TypeInformation.of(new TypeHint<>() {});
+
+            ValueStateDescriptor<LinkedList<BufferedImage>> descriptor =
+                    new ValueStateDescriptor<>("tile-window", typeInfo);
+            windowState = getRuntimeContext().getState(descriptor);
+        }
+
+        @Override
+        public void processElement(
+                Map<String, Object> data,
+                Context ctx,
+                Collector<ProcessedResult> out) throws Exception {
+
+            Integer tileId = (Integer) data.get("tile_id");
+            Integer batchId = (Integer) data.get("batch_id");
+            String printId = (String) data.get("print_id");
+
+            if (tileId == null || tileId == -1) {
+                shouldExit.set(true);
+                return;
+            }
+
+            try {
+                // Read the TIFF image
+                byte[] tiffData = (byte[]) data.get("tif");
+                if (tiffData == null) {
+                    return;
+                }
+
+                BufferedImage newImage = TiffProcessor.readTiff(tiffData);
+
+                // get current window or create new if it doesn't exist
+                LinkedList<BufferedImage> currentWindow = windowState.value();
+                if (currentWindow == null) {
+                    currentWindow = new LinkedList<>();
+                }
+
+                if (currentWindow.size() >= WINDOW_SIZE) {
+                    BufferedImage oldestImage = currentWindow.removeFirst();
+                    if (oldestImage != null) {
+                        oldestImage.flush();
+                    }
+                }
+
+                // add new image to the end
+                currentWindow.addLast(newImage);
+                windowState.update(currentWindow);
+
+                // process images in the window
+                int saturated = 0;
+                List<TiffProcessor.Centroid> centroids = Collections.emptyList();
+
+                if (!currentWindow.isEmpty()) {
+                    BufferedImage currentImage = currentWindow.getLast();
+                    saturated = TiffProcessor.countSaturatedPixels(currentImage);
+
+                    // only process full window of size 3 for centroids
+                    if (currentWindow.size() >= WINDOW_SIZE) {
+                        centroids = TiffProcessor.processWindow(new ArrayList<>(currentWindow), batchId);
+                    } else {
+                        log.debug("Not enough images ({}/{}) in window for centroid detection for tile {}",
+                                currentWindow.size(), WINDOW_SIZE, tileId);
+                    }
+                } else {
+                    log.info("No valid images in window for tile {}", tileId);
+                }
+
+                // convert centroids and emit result
+                // swap coordinate when we output result to match Python's results
+                List<Map<String, Object>> centroidMaps = new ArrayList<>();
+                for (TiffProcessor.Centroid c : centroids) {
+                    Map<String, Object> centroidMap = new HashMap<>();
+                    centroidMap.put("x", c.y);     // Python's x is our y
+                    centroidMap.put("y", c.x);     // Python's y is our x
+                    centroidMap.put("count", c.count);
+                    centroidMaps.add(centroidMap);
+                }
+
+                ProcessedResult result = new ProcessedResult(
+                        batchId,
+                        printId,
+                        tileId,
+                        (Integer) data.get("layer"),
+                        saturated,
+                        centroidMaps
+                );
+                uploadResult(result, MainController.benchId);
+                out.collect(result);
+
+            } catch (Exception e) {
+                log.error("Error processing tile {}: {}", tileId, e.getMessage(), e);
+                throw e; // Re-throw to let Flink handle the error according to its policies
+            }
+        }
+    }
+
+    public static void uploadResult(ProcessedResult result, String benchId) {
+        try (CloseableHttpClient httpClient = HttpClientBuilder.create().build()) {
+            String url = String.format("%s/api/result/0/%s/%d", MainController.API_URL,benchId, result.getBatchId());
+
+            // msgpack serialize
+            ObjectMapper mapper = new ObjectMapper(new MessagePackFactory());
+
+            Map<String, Object> resultMap = new HashMap<>();
+            resultMap.put("batch_id", result.getBatchId());
+            resultMap.put("query", 0);
+            resultMap.put("print_id", result.getPrintId());
+            resultMap.put("tile_id", result.getTileId());
+            resultMap.put("saturated", result.getSaturated());
+            resultMap.put("centroids", result.getCentroids());
+
+            byte[] payload = mapper.writeValueAsBytes(resultMap);
+
+            HttpPost post = new HttpPost(url);
+            post.setHeader("Content-Type", "application/msgpack");
+            post.setEntity(new ByteArrayEntity(payload, ContentType.create("application/msgpack")));
+            String response = httpClient.execute(post, HttpClientUtils.toStringResponseHandler());
+            log.debug("Uploaded result for tile_id={}, response={}", result.getTileId(), response);
+        } catch (Exception e) {
+            log.error("Failed to upload result for tile_id={}: {}", result.getTileId(), e.getMessage(), e);
+        }
+    }
+
+
+    @Data
+    public static class ProcessedResult {
+        private int batchId;
+        private String printId;
+        private int tileId;
+        private int layer;
+        private int saturated;
+        private List<Map<String, Object>> centroids;
+
+        public ProcessedResult(int batchId, String printId, int tileId, int layer, int saturated, List<Map<String, Object>> centroids) {
+            this.batchId = batchId;
+            this.printId = printId;
+            this.tileId = tileId;
+            this.layer = layer;
+            this.saturated = saturated;
+            this.centroids = centroids;
+        }
+    }
+}
